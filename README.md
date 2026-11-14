@@ -221,6 +221,12 @@ Issues and pull requests are welcome. See
 [`CONTRIBUTING.md`](https://github.com/nonagenticai/.github/blob/main/CONTRIBUTING.md) for the
 organisation-wide rules; this repository's own commands are in **Development** above.
 
+## Licensing
+
+The code in this repository is Apache-2.0 and needs no licence key to build, test or run. It
+contains no licence-enforcement code: the Apache-2.0 licence is the only licence that applies,
+and no licence server is involved.
+
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE). The code needs no licence key to build, test or run, and contains no licence-enforcement code: the Apache-2.0 licence is the only licence that applies, and no licence server is involved.
+Apache-2.0 — see [`LICENSE`](LICENSE).
