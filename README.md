@@ -152,3 +152,13 @@ GitHub Actions (`.github/workflows/ci.yml` → `nonagenticai/ci-workflows`'s pub
 4. From `main`: push `sha-<commit>` + `latest` to `ghcr.io/nonagenticai/java-test-executor` with a SLSA provenance attestation
 
 There is no deploy job: this service is retired from the estate's cluster, and the repository is published so its tests, image build and job contract stay reproducible.
+
+## Licensing
+
+The code in this repository is Apache-2.0 and needs no licence key to build, test or run.
+It contains no licence-enforcement code: the Apache-2.0 licence in [`LICENSE`](LICENSE) is the
+only licence that applies, and no licence server is involved.
+
+## License
+
+Apache-2.0 — see [`LICENSE`](LICENSE).
