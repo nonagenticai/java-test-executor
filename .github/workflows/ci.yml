@@ -37,7 +37,7 @@ jobs:
         docker run -d --name smoke-java-executor -p 18088:8088 "$IMAGE_REF"
         ok=0
         for i in $(seq 1 30); do
-          if curl -sf http://127.0.0.1:18089/health >/dev/null 2>&1; then
+          if curl -sf http://127.0.0.1:18088/health >/dev/null 2>&1; then
             echo "health ok (attempt $i)"; ok=1; break
           fi
           sleep 1

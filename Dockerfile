@@ -79,12 +79,15 @@ RUN mkdir -p /opt/bake/src/main/java /opt/bake/src/test/java \
  && cd /opt/bake \
  # `mvn test` warms junit + surefire + jacoco (prepare-agent and report are bound
  # to the test phase by the template). The second run warms the three analysis
- # plugins the service invokes by default; violations must not fail the BAKE, only
- # a missing artifact should.
+ # plugins the service invokes by default. It uses the REPORT goals, not the
+ # `check` goals: violations must never fail the bake — only a missing artifact
+ # should — and `-D*.failOnViolation=false` does not override a value the pom
+ # template sets in <configuration>. Measured 2026-11-14: with `check`, a newer
+ # plugin resolved at build time failed the image on JavadocPackage/FinalParameters
+ # in the throwaway bake source. The report goals download the same artifacts.
  && mvn -B -q -Dmaven.repo.local=/opt/m2 test \
  && mvn -B -q -Dmaven.repo.local=/opt/m2 \
-        -Dcheckstyle.failOnViolation=false -Dpmd.failOnViolation=false -Dspotbugs.failOnError=false \
-        checkstyle:check pmd:check spotbugs:check \
+        checkstyle:checkstyle pmd:pmd spotbugs:spotbugs \
  && rm -rf /opt/bake /opt/bake-src \
  # Readable + traversable by any uid: the Deployment runs this container non-root,
  # and a repository it cannot read is a repository that does not exist.
