@@ -1,0 +1,25 @@
+services:
+  java-test-executor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: java-test-executor
+    ports:
+      - "0.0.0.0:8088:8088"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      PORT: 8088
+      TEST_MODE: "true"
+    networks:
+      - workflow-system-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  workflow-system-network:
+    driver: bridge
