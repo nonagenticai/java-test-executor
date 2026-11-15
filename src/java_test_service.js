@@ -1094,9 +1094,16 @@ app.post('/validate', expensiveRouteLimiter, async (req, res) => {
         // the normalised path to sit under `root + path.sep` (the component
         // boundary stops a sibling directory sharing the root's prefix) before
         // it reaches fs; the normalised path is what gets written.
+        //
+        // The join must happen INSIDE the resolve with the caller value as the
+        // last argument: the query's RelativePathStartsWithSanitizer only
+        // accepts a `startsWith` guard when the tainted suffix is the final
+        // argument of a `path.join` handed to `path.resolve`. Passing
+        // `validationId` as a separate resolve argument (the first attempt at
+        // this fix) leaves the alert open even though the guard is correct.
         const workspaceRoot = path.resolve(TEST_WORKSPACE);
-        const javaFile = path.resolve(workspaceRoot, validationId, `${className}.java`);
-        if (javaFile !== workspaceRoot && !javaFile.startsWith(workspaceRoot + path.sep)) {
+        const javaFile = path.resolve(path.join(workspaceRoot, validationId, `${className}.java`));
+        if (!javaFile.startsWith(workspaceRoot + path.sep)) {
             await fs.rm(tempPath, { recursive: true, force: true });
             return res.status(400).json({
                 validationId,
