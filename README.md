@@ -149,6 +149,8 @@ Compiles a single Java file with `javac` to check syntax validity.
 | `EXECUTION_TIMEOUT` | `300` | Per-command timeout in seconds |
 | `TEST_WORKSPACE` | `/app/test_workspace` | Directory for ephemeral project scaffolds |
 | `REPORTS_DIR` | `/app/reports` | Directory for generated reports |
+| `RATE_LIMIT_MAX` | `60` | Requests per client address per window across `/execute` and `/validate` before the service returns `429`. |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window in milliseconds. |
 
 The workspace and reports directories must be writable by the process.
 

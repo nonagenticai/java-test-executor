@@ -17,6 +17,7 @@ const {
     installGracefulShutdown,
 } = require('./common');
 const { spawn, exec } = require('child_process');
+const { rateLimit } = require('express-rate-limit');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
@@ -27,6 +28,33 @@ const PORT = process.env.PORT || 8088;
 const EXECUTION_TIMEOUT = parseInt(process.env.EXECUTION_TIMEOUT || '300') * 1000; // 5 minutes for Java builds
 const TEST_WORKSPACE = process.env.TEST_WORKSPACE || '/app/test_workspace';
 const REPORTS_DIR = process.env.REPORTS_DIR || '/app/reports';
+
+// ── Rate limiting ───────────────────────────────────────────────────────────
+// /execute scaffolds, writes, compiles, tests and deletes a Maven/Gradle
+// project on disk; /validate writes a source file and runs javac. Each
+// request is seconds to minutes of CPU and
+// scratch-disk churn, and CodeQL js/missing-rate-limiting raised both routes.
+// This is an in-process counter keyed on the caller's address: the
+// orchestrator is the only caller (tenantGuard), so there is one meaningful
+// bucket, and an external attacker cannot bypass it by rotating addresses.
+// Defaults: 60 requests per 60 s, overridable with RATE_LIMIT_MAX /
+// RATE_LIMIT_WINDOW_MS. Invalid overrides fall back to the default rather than
+// disabling the limit.
+function positiveIntFromEnv(name, fallback) {
+    const parsed = Number.parseInt(process.env[name], 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const RATE_LIMIT_MAX = positiveIntFromEnv('RATE_LIMIT_MAX', 60);
+const RATE_LIMIT_WINDOW_MS = positiveIntFromEnv('RATE_LIMIT_WINDOW_MS', 60 * 1000);
+
+const expensiveRouteLimiter = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: RATE_LIMIT_MAX,
+    standardHeaders: true, // RateLimit-Limit / -Remaining / -Reset on responses
+    legacyHeaders: false,
+    message: { error: 'Too many requests', detail: 'This executor is rate-limited.' },
+});
 
 // Create a queue for serializing Maven/Gradle operations
 const { promisify } = require('util');
@@ -456,6 +484,60 @@ app.get('/health', (req, res) => {
 const JAVA_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 /**
+ * Remove block comments with a single left-to-right scan.
+ *
+ * The regex it replaces, /\/\*[\s\S]*?\*\//g, was flagged as
+ * js/polynomial-redos: on an unterminated '/*' followed by many 'a/*'
+ * repetitions the lazy group retries the closing star-slash from every
+ * position of the suffix, and the global flag then restarts that scan at every
+ * later '/*'. Each candidate start is skipped with indexOf and a match consumes
+ * its bytes, so the whole input is walked once. An unterminated '/*' is left
+ * untouched, exactly as the old regex left it.
+ */
+function stripBlockComments(code) {
+    let output = '';
+    let index = 0;
+    for (;;) {
+        const start = code.indexOf('/*', index);
+        if (start === -1) {
+            return output + code.slice(index);
+        }
+        output += code.slice(index, start);
+        const end = code.indexOf('*/', start + 2);
+        if (end === -1) {
+            return output + code.slice(start);
+        }
+        output += ' ';
+        index = end + 2;
+    }
+}
+
+/**
+ * Remove line comments with a single left-to-right scan.
+ *
+ * Equivalent to the old global line-comment replace: everything from '//' up
+ * to (not including) the next newline is removed, so a trailing carriage
+ * return is part of the comment. Kept as a scanner for the same reason as
+ * stripBlockComments — no repeated re-scanning of the suffix.
+ */
+function stripLineComments(code) {
+    let output = '';
+    let index = 0;
+    for (;;) {
+        const start = code.indexOf('//', index);
+        if (start === -1) {
+            return output + code.slice(index);
+        }
+        output += code.slice(index, start) + ' ';
+        const newline = code.indexOf('\n', start + 2);
+        if (newline === -1) {
+            return output;
+        }
+        index = newline; // keep the newline itself
+    }
+}
+
+/**
  * Pull the package and the declared type name out of a Java source string.
  *
  * `code` is materialised as a file on disk, and javac requires a public type to live in
@@ -465,9 +547,7 @@ const JAVA_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
  * Returns { packageName, className } or null when no type declaration is present.
  */
 function parseJavaSource(code) {
-    const withoutComments = code
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')
-        .replace(/\/\/[^\n]*/g, ' ');
+    const withoutComments = stripLineComments(stripBlockComments(code));
 
     const typeMatch = withoutComments.match(
         /\b(?:class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)/
@@ -527,9 +607,33 @@ function fileMapError(name, value) {
 }
 
 /**
+ * Resolve `relativePath` beneath `root` and refuse anything that escapes it.
+ *
+ * js/path-injection flagged the `${className}.java` write on /validate: the
+ * JAVA_IDENTIFIER check above it constrains the value, but a validation regex
+ * is not a path operation and the query does not treat it as one. The pattern
+ * the query models is normalise-then-compare: resolve both sides and require
+ * the result to be the root itself or to sit under `root + path.sep` — the
+ * separator boundary is what stops a sibling `/app/test_workspace_evil` from
+ * passing a bare prefix test. Every caller-influenced path that reaches fs is
+ * funnelled through here, and the RESOLVED path is the one used for the file
+ * operation, so a normalised-and-checked string is what reaches fs.
+ *
+ * Returns the normalised path, or null when it escapes the root.
+ */
+function resolveWithinRoot(root, relativePath) {
+    const resolvedRoot = path.resolve(root);
+    const resolved = path.resolve(resolvedRoot, relativePath);
+    if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) {
+        return null;
+    }
+    return resolved;
+}
+
+/**
  * Execute Java tests
  */
-app.post('/execute', async (req, res) => {
+app.post('/execute', expensiveRouteLimiter, async (req, res) => {
     const executionId = crypto.randomUUID();
     const startTime = Date.now();
     
@@ -662,26 +766,52 @@ app.post('/execute', async (req, res) => {
         await fs.mkdir(path.join(projectPath, 'src', 'main', 'java'), { recursive: true });
         await fs.mkdir(path.join(projectPath, 'src', 'test', 'java'), { recursive: true });
         
-        // Write main source files
+        // Write main source files. Each caller-supplied key is resolved under
+        // the project's source root and refused if it escapes it; the resolved
+        // path is what fs sees (see resolveWithinRoot).
+        const mainSourceRoot = path.join(projectPath, 'src', 'main', 'java');
         for (const [filePath, content] of Object.entries(mainFiles)) {
-            const fullPath = path.join(projectPath, 'src', 'main', 'java', filePath);
+            const fullPath = resolveWithinRoot(mainSourceRoot, filePath);
+            if (!fullPath) {
+                return res.status(400).json({
+                    executionId,
+                    success: false,
+                    error: `mainFiles contains an unsafe file path: "${filePath}"`,
+                    duration: Date.now() - startTime
+                });
+            }
             await fs.mkdir(path.dirname(fullPath), { recursive: true });
             await fs.writeFile(fullPath, content);
         }
-        
+
         // Write `code` as a test source. Written BEFORE testFiles so that an explicit
         // testFiles entry at the same path stays authoritative.
+        const testSourceRoot = path.join(projectPath, 'src', 'test', 'java');
         if (codeSource) {
-            const fullPath = path.join(
-                projectPath, 'src', 'test', 'java', codeSource.relativePath
-            );
+            const fullPath = resolveWithinRoot(testSourceRoot, codeSource.relativePath);
+            if (!fullPath) {
+                return res.status(400).json({
+                    executionId,
+                    success: false,
+                    error: 'code declares a package or type name that is not a safe file path',
+                    duration: Date.now() - startTime
+                });
+            }
             await fs.mkdir(path.dirname(fullPath), { recursive: true });
             await fs.writeFile(fullPath, codeSource.content);
         }
 
         // Write test files
         for (const [filePath, content] of Object.entries(testFiles)) {
-            const fullPath = path.join(projectPath, 'src', 'test', 'java', filePath);
+            const fullPath = resolveWithinRoot(testSourceRoot, filePath);
+            if (!fullPath) {
+                return res.status(400).json({
+                    executionId,
+                    success: false,
+                    error: `testFiles contains an unsafe file path: "${filePath}"`,
+                    duration: Date.now() - startTime
+                });
+            }
             await fs.mkdir(path.dirname(fullPath), { recursive: true });
             await fs.writeFile(fullPath, content);
         }
@@ -906,7 +1036,7 @@ app.get('/frameworks', (req, res) => {
 /**
  * Validate Java code syntax
  */
-app.post('/validate', async (req, res) => {
+app.post('/validate', expensiveRouteLimiter, async (req, res) => {
     const validationId = crypto.randomUUID();
     
     try {
@@ -957,8 +1087,24 @@ app.post('/validate', async (req, res) => {
         // Create temporary file for validation
         const tempPath = path.join(TEST_WORKSPACE, validationId);
         await fs.mkdir(tempPath, { recursive: true });
-        
-        const javaFile = path.join(tempPath, `${className}.java`);
+
+        // `className` is validated as a Java identifier above, but a validation
+        // regex is not a path operation and CodeQL js/path-injection does not
+        // follow it. Resolve the file against the workspace root and require
+        // the normalised path to sit under `root + path.sep` (the component
+        // boundary stops a sibling directory sharing the root's prefix) before
+        // it reaches fs; the normalised path is what gets written.
+        const workspaceRoot = path.resolve(TEST_WORKSPACE);
+        const javaFile = path.resolve(workspaceRoot, validationId, `${className}.java`);
+        if (javaFile !== workspaceRoot && !javaFile.startsWith(workspaceRoot + path.sep)) {
+            await fs.rm(tempPath, { recursive: true, force: true });
+            return res.status(400).json({
+                validationId,
+                valid: false,
+                errors: ['className must resolve inside the validation workspace'],
+                output: ''
+            });
+        }
         await fs.writeFile(javaFile, code);
         
         // Try to compile the file
@@ -1018,6 +1164,9 @@ module.exports = {
     detectBuildSystem,
     detectTestingFramework,
     parseJavaSource,
+    stripBlockComments,
+    stripLineComments,
+    resolveWithinRoot,
     nonStringFieldError,
     fileMapError,
     startServer,
